@@ -213,72 +213,34 @@ async function handleMessage(message: TelegramMessage) {
   const hasMedia = message.photo || message.video;
   if (!hasMedia) return;
 
-  const mediaGroupId = message.media_group_id;
-
-  if (mediaGroupId) {
-    // Part of a media group — buffer it
-    let group = mediaGroupBuffer.get(mediaGroupId);
-    if (!group) {
-      group = {
-        chatId,
-        userId,
-        caption: null,
-        photoFileIds: [],
-        videoFileIds: [],
-        timer: setTimeout(() => {
-          const g = mediaGroupBuffer.get(mediaGroupId);
-          if (g) {
-            mediaGroupBuffer.delete(mediaGroupId);
-            processMediaGroup(g);
-          }
-        }, 2000), // 2s debounce
-      };
-      mediaGroupBuffer.set(mediaGroupId, group);
-    }
-
-    // Capture caption from whichever message has it
-    if (message.caption) {
-      group.caption = message.caption;
-    }
-
-    if (message.photo) {
-      const best = getHighestResolutionPhoto(message.photo);
-      group.photoFileIds.push(best.file_id);
-    }
-    if (message.video) {
-      group.videoFileIds.push(message.video.file_id);
-    }
-
-    // Reset debounce timer
-    clearTimeout(group.timer);
-    group.timer = setTimeout(() => {
-      const g = mediaGroupBuffer.get(mediaGroupId);
-      if (g) {
-        mediaGroupBuffer.delete(mediaGroupId);
-        processMediaGroup(g);
-      }
-    }, 2000);
-  } else {
-    // Single photo/video — process immediately
-    const singleGroup: BufferedMediaGroup = {
-      chatId,
-      userId,
-      caption: message.caption ?? null,
-      photoFileIds: [],
-      videoFileIds: [],
-      timer: null as unknown as ReturnType<typeof setTimeout>,
-    };
-
-    if (message.photo) {
-      const best = getHighestResolutionPhoto(message.photo);
-      singleGroup.photoFileIds.push(best.file_id);
-    }
-    if (message.video) {
-      singleGroup.videoFileIds.push(message.video.file_id);
-    }
-
-    await processMediaGroup(singleGroup);
+  // For media groups: only process the message that has the caption.
+  // Each photo in an album fires a separate webhook — we can't buffer with
+  // setTimeout on serverless (function dies after returning 200).
+  // So we process whichever message carries the caption and use that one photo.
+  if (message.media_group_id && !message.caption) {
+    // Part of an album but this message has no caption — skip it.
+    return;
   }
+
+  // Process immediately (single photo OR album message with caption)
+  const group: BufferedMediaGroup = {
+    chatId,
+    userId,
+    caption: message.caption ?? null,
+    photoFileIds: [],
+    videoFileIds: [],
+    timer: null as unknown as ReturnType<typeof setTimeout>,
+  };
+
+  if (message.photo) {
+    const best = getHighestResolutionPhoto(message.photo);
+    group.photoFileIds.push(best.file_id);
+  }
+  if (message.video) {
+    group.videoFileIds.push(message.video.file_id);
+  }
+
+  await processMediaGroup(group);
 }
 
 async function handleCallbackQuery(callbackQuery: TelegramUpdate["callback_query"]) {
