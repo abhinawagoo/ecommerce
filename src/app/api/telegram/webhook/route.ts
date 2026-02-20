@@ -12,6 +12,7 @@ import { parseProductText } from "@/services/ai-parser.service";
 import { createProductFromTelegram } from "@/services/product-admin.service";
 import {
   bufferAlbumPhoto,
+  bufferAlbumCaption,
   claimAndGetAlbumPhotos,
 } from "@/services/telegram-media-group.service";
 
@@ -31,7 +32,7 @@ async function handleMessage(message: TelegramMessage) {
   if (message.text === "/start") {
     await sendMessage(
       chatId,
-      "👋 Welcome to the Product Listing Bot!\n\nSend a photo (or an album of photos) with a caption containing product details (name, price, sizes, brand, category, gender) and I'll publish it automatically."
+      "👋 Welcome to the Product Listing Bot!\n\nSend a photo (or an album of multiple photos) with a caption containing product details (name, price, sizes, brand, category, gender) and I'll publish it automatically."
     );
     return;
   }
@@ -76,7 +77,7 @@ async function handleMessage(message: TelegramMessage) {
 
   // Text-only message
   if (message.text && !message.photo && !message.video) {
-    await sendMessage(chatId, "📸 Please send a photo (or an album of photos) with the product details as the caption.");
+    await sendMessage(chatId, "📸 Please send a photo (or album) with product details as the caption.");
     return;
   }
 
@@ -85,36 +86,45 @@ async function handleMessage(message: TelegramMessage) {
 
   // ── Album (media group) ───────────────────────────────────────────────────
   if (message.media_group_id) {
-    const photoFileId = message.photo
-      ? getHighestResolutionPhoto(message.photo).file_id
-      : null;
+    const photo = message.photo ? getHighestResolutionPhoto(message.photo) : null;
 
-    // Buffer every photo in the album into Supabase (atomic upsert).
-    await bufferAlbumPhoto(
-      message.media_group_id,
-      chatId,
-      userId,
-      photoFileId,
-      message.caption ?? null
-    );
+    // Buffer every photo in the album — each uses a unique key so concurrent
+    // webhook calls never overwrite each other.
+    if (photo) {
+      await bufferAlbumPhoto(
+        message.media_group_id,
+        chatId,
+        userId,
+        photo.file_id,
+        photo.file_unique_id
+      );
+    }
 
-    // Only the captioned message drives processing.
+    // Store the caption when present (Telegram puts it on one of the messages).
+    if (message.caption) {
+      await bufferAlbumCaption(message.media_group_id, chatId, userId, message.caption);
+    }
+
+    // Only the captioned message drives processing — all others return here.
     if (!message.caption) return;
 
-    // Wait a moment for the remaining album messages to arrive and be buffered.
-    // Telegram sends all album messages within ~1 second; 2.5 s is safe.
-    await new Promise<void>((resolve) => setTimeout(resolve, 2500));
+    // Wait for the remaining album messages to arrive and be buffered.
+    // Telegram sends all album messages within ~1 second; 3 s is ample.
+    await new Promise<void>((resolve) => setTimeout(resolve, 3000));
 
-    // Atomically claim this group — returns null if already processed.
+    // Collect all buffered photos + caption, clean up the temp rows.
     const group = await claimAndGetAlbumPhotos(message.media_group_id);
-    if (!group) return;
+    if (!group || group.photoFileIds.length === 0) {
+      await sendMessage(chatId, "⚠️ No photos found in buffer. Please try again.");
+      return;
+    }
 
     await sendMessage(chatId, `⏳ Publishing product with ${group.photoFileIds.length} image(s)...`);
 
     try {
       const productId = crypto.randomUUID();
 
-      // Download + upload all photos in parallel alongside AI parsing.
+      // Parse caption + download/upload all photos in parallel.
       const [parsed, ...maybeUrls] = await Promise.all([
         parseProductText(group.caption),
         ...group.photoFileIds.map((fileId, i) =>
@@ -127,7 +137,6 @@ async function handleMessage(message: TelegramMessage) {
       ]);
 
       const imageUrls = maybeUrls.filter((u): u is string => u !== null);
-
       const { slug } = await createProductFromTelegram(parsed, imageUrls, []);
 
       const siteUrl = process.env.NEXT_PUBLIC_SITE_URL ?? "https://ecommerce-omega-ashy-36.vercel.app";

@@ -1,3 +1,15 @@
+/**
+ * Buffers Telegram album (media group) photos in the existing admin_settings
+ * table — no extra migration required.
+ *
+ * Key convention (all share the same media_group_id prefix):
+ *   tg_mg_{mediaGroupId}_photo_{fileUniqueId}   ← one row per photo
+ *   tg_mg_{mediaGroupId}_caption                ← one row for the caption
+ *
+ * Because each photo uses a unique key (file_unique_id), concurrent webhook
+ * invocations never conflict with each other.
+ */
+
 import { createClient } from "@supabase/supabase-js";
 
 function getServiceClient() {
@@ -7,26 +19,33 @@ function getServiceClient() {
   );
 }
 
-/**
- * Upsert a photo file_id (and optional caption) into the media-group buffer.
- * Safe to call concurrently — the SQL function uses atomic INSERT ... ON CONFLICT.
- */
 export async function bufferAlbumPhoto(
   mediaGroupId: string,
   chatId: number,
   userId: number,
-  photoFileId: string | null,
-  caption: string | null
+  photoFileId: string,
+  fileUniqueId: string
 ): Promise<void> {
   const supabase = getServiceClient();
-  const { error } = await supabase.rpc("upsert_telegram_media_group", {
-    p_media_group_id: mediaGroupId,
-    p_chat_id: chatId,
-    p_user_id: userId,
-    p_photo_file_id: photoFileId,
-    p_caption: caption,
+  const { error } = await supabase.from("admin_settings").upsert({
+    key: `tg_mg_${mediaGroupId}_photo_${fileUniqueId}`,
+    value: { fileId: photoFileId, chatId, userId },
   });
-  if (error) throw new Error(`Failed to buffer album photo: ${error.message}`);
+  if (error) throw new Error(`bufferAlbumPhoto failed: ${error.message}`);
+}
+
+export async function bufferAlbumCaption(
+  mediaGroupId: string,
+  chatId: number,
+  userId: number,
+  caption: string
+): Promise<void> {
+  const supabase = getServiceClient();
+  const { error } = await supabase.from("admin_settings").upsert({
+    key: `tg_mg_${mediaGroupId}_caption`,
+    value: { caption, chatId, userId },
+  });
+  if (error) throw new Error(`bufferAlbumCaption failed: ${error.message}`);
 }
 
 export interface ClaimedMediaGroup {
@@ -37,23 +56,38 @@ export interface ClaimedMediaGroup {
 }
 
 /**
- * Atomically mark the group as processed and return all its data.
- * Returns null if the group was already claimed by another invocation.
+ * Reads all buffered photos + caption for this album, deletes the temp rows,
+ * and returns the collected data. Only the captioned webhook message calls
+ * this, so there is no race condition between invocations.
  */
 export async function claimAndGetAlbumPhotos(
   mediaGroupId: string
 ): Promise<ClaimedMediaGroup | null> {
   const supabase = getServiceClient();
-  const { data, error } = await supabase.rpc("claim_telegram_media_group", {
-    p_media_group_id: mediaGroupId,
-  });
-  if (error) throw new Error(`Failed to claim media group: ${error.message}`);
+  const prefix = `tg_mg_${mediaGroupId}_`;
+
+  const { data, error } = await supabase
+    .from("admin_settings")
+    .select("key, value")
+    .like("key", `${prefix}%`);
+
+  if (error) throw new Error(`claimAndGetAlbumPhotos failed: ${error.message}`);
   if (!data || data.length === 0) return null;
-  const row = data[0];
+
+  const captionRow = data.find((r) => r.key === `${prefix}caption`);
+  if (!captionRow) return null;
+
+  const photoFileIds = data
+    .filter((r) => r.key.startsWith(`${prefix}photo_`))
+    .map((r) => r.value.fileId as string);
+
+  // Clean up all temp rows for this album
+  await supabase.from("admin_settings").delete().like("key", `${prefix}%`);
+
   return {
-    chatId: row.r_chat_id,
-    userId: row.r_user_id,
-    caption: row.r_caption,
-    photoFileIds: row.r_photo_file_ids,
+    chatId: captionRow.value.chatId as number,
+    userId: captionRow.value.userId as number,
+    caption: captionRow.value.caption as string,
+    photoFileIds,
   };
 }
