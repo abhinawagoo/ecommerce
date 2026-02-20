@@ -1,16 +1,18 @@
 /**
- * Buffers Telegram album (media group) photos in the existing admin_settings
- * table — no extra migration required.
+ * Album photo handling — no waiting, no timing issues.
  *
- * Key convention (all share the same media_group_id prefix):
- *   tg_mg_{mediaGroupId}_photo_{fileUniqueId}   ← one row per photo
- *   tg_mg_{mediaGroupId}_caption                ← one row for the caption
+ * Strategy:
+ * 1. Captioned message arrives first → create product immediately with 1 image
+ *    → store tg_mg_product_{mediaGroupId} so late-arriving photos can find the product
+ * 2. Non-captioned messages arrive later → find the product → upload + add to product_images
  *
- * Because each photo uses a unique key (file_unique_id), concurrent webhook
- * invocations never conflict with each other.
+ * If non-captioned messages somehow arrive before the captioned one, they buffer
+ * themselves (tg_mg_pending_{mediaGroupId}_{fileUniqueId}) and the captioned
+ * handler picks them up when it runs.
  */
 
 import { createClient } from "@supabase/supabase-js";
+import { randomUUID } from "crypto";
 
 function getServiceClient() {
   return createClient(
@@ -19,84 +21,98 @@ function getServiceClient() {
   );
 }
 
-export async function bufferAlbumPhoto(
+// ── Product mapping (set once product is created) ─────────────────────────────
+
+export interface MediaGroupProduct {
+  productId: string;
+  slug: string;
+  name: string;
+}
+
+export async function storeMediaGroupProduct(
   mediaGroupId: string,
-  chatId: number,
-  userId: number,
-  photoFileId: string,
+  product: MediaGroupProduct
+): Promise<void> {
+  const supabase = getServiceClient();
+  const { error } = await supabase.from("admin_settings").upsert(
+    { key: `tg_mg_product_${mediaGroupId}`, value: product },
+    { onConflict: "key" }
+  );
+  if (error) throw new Error(`storeMediaGroupProduct failed: ${error.message}`);
+}
+
+export async function getMediaGroupProduct(
+  mediaGroupId: string
+): Promise<MediaGroupProduct | null> {
+  const supabase = getServiceClient();
+  const { data } = await supabase
+    .from("admin_settings")
+    .select("value")
+    .eq("key", `tg_mg_product_${mediaGroupId}`)
+    .single();
+  if (!data) return null;
+  return data.value as MediaGroupProduct;
+}
+
+// ── Pending buffer (non-captioned photos that arrive before product is created) ─
+
+export async function bufferPendingPhoto(
+  mediaGroupId: string,
+  fileId: string,
   fileUniqueId: string
 ): Promise<void> {
   const supabase = getServiceClient();
-  // onConflict: 'key' is required — admin_settings primary key is `id` (UUID),
-  // so without this, upsert defaults to ON CONFLICT (id) which never matches
-  // when id is auto-generated, potentially causing unique-constraint errors.
   const { error } = await supabase.from("admin_settings").upsert(
     {
-      key: `tg_mg_${mediaGroupId}_photo_${fileUniqueId}`,
-      value: { fileId: photoFileId, chatId, userId },
+      key: `tg_mg_pending_${mediaGroupId}_${fileUniqueId}`,
+      value: { fileId },
     },
     { onConflict: "key" }
   );
-  if (error) throw new Error(`bufferAlbumPhoto failed: ${error.message}`);
+  if (error) throw new Error(`bufferPendingPhoto failed: ${error.message}`);
 }
 
-export async function bufferAlbumCaption(
-  mediaGroupId: string,
-  chatId: number,
-  userId: number,
-  caption: string
+/** Returns all pending file IDs and deletes them from the buffer. */
+export async function collectAndClearPendingPhotos(
+  mediaGroupId: string
+): Promise<string[]> {
+  const supabase = getServiceClient();
+  const pattern = `tg_mg_pending_${mediaGroupId}_%`;
+
+  const { data } = await supabase
+    .from("admin_settings")
+    .select("value")
+    .like("key", pattern);
+
+  await supabase.from("admin_settings").delete().like("key", pattern);
+
+  return (data ?? []).map((r) => r.value.fileId as string);
+}
+
+// ── Add a single image to an existing product ─────────────────────────────────
+
+export async function addImageToProduct(
+  productId: string,
+  imageUrl: string
 ): Promise<void> {
   const supabase = getServiceClient();
-  const { error } = await supabase.from("admin_settings").upsert(
-    {
-      key: `tg_mg_${mediaGroupId}_caption`,
-      value: { caption, chatId, userId },
-    },
-    { onConflict: "key" }
-  );
-  if (error) throw new Error(`bufferAlbumCaption failed: ${error.message}`);
-}
 
-export interface ClaimedMediaGroup {
-  chatId: number;
-  userId: number;
-  caption: string;
-  photoFileIds: string[];
-}
+  // Get current max position so we don't overwrite existing images
+  const { data: existing } = await supabase
+    .from("product_images")
+    .select("position")
+    .eq("product_id", productId)
+    .order("position", { ascending: false })
+    .limit(1);
 
-/**
- * Reads all buffered photos + caption for this album, deletes the temp rows,
- * and returns the collected data. Only the captioned webhook message calls
- * this, so there is no race condition between invocations.
- */
-export async function claimAndGetAlbumPhotos(
-  mediaGroupId: string
-): Promise<ClaimedMediaGroup | null> {
-  const supabase = getServiceClient();
-  const prefix = `tg_mg_${mediaGroupId}_`;
+  const nextPosition = existing && existing.length > 0 ? existing[0].position + 1 : 1;
 
-  const { data, error } = await supabase
-    .from("admin_settings")
-    .select("key, value")
-    .like("key", `${prefix}%`);
-
-  if (error) throw new Error(`claimAndGetAlbumPhotos failed: ${error.message}`);
-  if (!data || data.length === 0) return null;
-
-  const captionRow = data.find((r) => r.key === `${prefix}caption`);
-  if (!captionRow) return null;
-
-  const photoFileIds = data
-    .filter((r) => r.key.startsWith(`${prefix}photo_`))
-    .map((r) => r.value.fileId as string);
-
-  // Clean up all temp rows for this album
-  await supabase.from("admin_settings").delete().like("key", `${prefix}%`);
-
-  return {
-    chatId: captionRow.value.chatId as number,
-    userId: captionRow.value.userId as number,
-    caption: captionRow.value.caption as string,
-    photoFileIds,
-  };
+  const { error } = await supabase.from("product_images").insert({
+    id: randomUUID(),
+    product_id: productId,
+    url: imageUrl,
+    alt: `Image ${nextPosition + 1}`,
+    position: nextPosition,
+  });
+  if (error) throw new Error(`addImageToProduct failed: ${error.message}`);
 }

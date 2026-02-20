@@ -10,17 +10,16 @@ import {
 import { uploadImageToR2, uploadVideoToR2 } from "@/services/r2-upload.service";
 import { parseProductText } from "@/services/ai-parser.service";
 import { createProductFromTelegram } from "@/services/product-admin.service";
-import { createClient } from "@supabase/supabase-js";
+import {
+  storeMediaGroupProduct,
+  getMediaGroupProduct,
+  bufferPendingPhoto,
+  collectAndClearPendingPhotos,
+  addImageToProduct,
+} from "@/services/telegram-media-group.service";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
-
-function getSupabase() {
-  return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!
-  );
-}
 
 async function handleMessage(message: TelegramMessage) {
   const userId = message.from?.id;
@@ -35,44 +34,8 @@ async function handleMessage(message: TelegramMessage) {
   if (message.text === "/start") {
     await sendMessage(
       chatId,
-      "👋 Welcome to the Product Listing Bot!\n\nSend a photo (or album) with product details as caption."
+      "👋 Welcome to the Product Listing Bot!\n\nSend a photo (or album of photos) with product details as caption. Extra album photos are added automatically."
     );
-    return;
-  }
-
-  // /debug_album — shows what is currently buffered in admin_settings
-  if (message.text === "/debug_album") {
-    const supabase = getSupabase();
-    const { data, error } = await supabase
-      .from("admin_settings")
-      .select("key, value")
-      .like("key", "tg_mg_%");
-    if (error) {
-      await sendMessage(chatId, `❌ DB error: ${error.message}`);
-      return;
-    }
-    if (!data || data.length === 0) {
-      await sendMessage(chatId, "📭 No album buffer entries found in admin_settings.");
-      return;
-    }
-    const lines = data.map((r) => `• ${r.key}\n  ${JSON.stringify(r.value)}`);
-    await sendMessage(chatId, `📦 Buffer entries (${data.length}):\n\n${lines.join("\n\n")}`);
-    return;
-  }
-
-  // /debug_write — tests if writing to admin_settings works
-  if (message.text === "/debug_write") {
-    const supabase = getSupabase();
-    const testKey = `tg_mg_test_${Date.now()}`;
-    const { error } = await supabase.from("admin_settings").upsert(
-      { key: testKey, value: { test: true, ts: Date.now() } },
-      { onConflict: "key" }
-    );
-    if (error) {
-      await sendMessage(chatId, `❌ Write failed: ${error.message}`);
-    } else {
-      await sendMessage(chatId, `✅ Write OK (key: ${testKey})\nSend /debug_album to verify it appears.`);
-    }
     return;
   }
 
@@ -97,7 +60,8 @@ async function handleMessage(message: TelegramMessage) {
       results.push(`❌ R2 failed: ${e instanceof Error ? e.message : String(e)}`);
     }
     try {
-      const supabase = getSupabase();
+      const { createClient } = await import("@supabase/supabase-js");
+      const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
       const { error } = await supabase.from("products").select("id").limit(1);
       if (error) throw error;
       results.push("✅ Supabase OK");
@@ -120,67 +84,55 @@ async function handleMessage(message: TelegramMessage) {
   // ── Album (media group) ───────────────────────────────────────────────────
   if (message.media_group_id) {
     const photo = message.photo ? getHighestResolutionPhoto(message.photo) : null;
-    const supabase = getSupabase();
 
-    // Buffer this photo into admin_settings using a unique key per photo.
-    if (photo) {
-      const bufferKey = `tg_mg_${message.media_group_id}_photo_${photo.file_unique_id}`;
-      const { error: writeErr } = await supabase.from("admin_settings").upsert(
-        { key: bufferKey, value: { fileId: photo.file_id, chatId, userId } },
-        { onConflict: "key" }
-      );
-      if (writeErr) {
-        console.error(`Buffer write failed [${bufferKey}]:`, writeErr.message);
-        // Report the error so we can diagnose remotely
-        if (message.caption) {
-          await sendMessage(chatId, `⚠️ Buffer write error: ${writeErr.message}\nProceeding with single image.`);
+    // ── Non-captioned album photo ────────────────────────────────────────────
+    if (!message.caption) {
+      if (!photo) return;
+
+      // Check if the product was already created (captioned message ran first)
+      const existing = await getMediaGroupProduct(message.media_group_id);
+
+      if (existing) {
+        // Product exists — upload this photo and attach it directly
+        try {
+          const fileInfo = await getFile(photo.file_id);
+          if (fileInfo.file_path) {
+            const buf = await downloadFile(fileInfo.file_path);
+            const url = await uploadImageToR2(buf, existing.productId, 99);
+            await addImageToProduct(existing.productId, url);
+          }
+        } catch (e) {
+          console.error("Failed to add extra album photo:", e);
+        }
+      } else {
+        // Product not yet created — buffer this photo for the captioned handler
+        try {
+          await bufferPendingPhoto(message.media_group_id, photo.file_id, photo.file_unique_id);
+        } catch (e) {
+          console.error("Failed to buffer pending photo:", e);
         }
       }
-    }
-
-    // Buffer the caption too
-    if (message.caption) {
-      await supabase.from("admin_settings").upsert(
-        {
-          key: `tg_mg_${message.media_group_id}_caption`,
-          value: { caption: message.caption, chatId, userId },
-        },
-        { onConflict: "key" }
-      );
-    }
-
-    // Non-captioned messages exit here after buffering
-    if (!message.caption) return;
-
-    // The captioned message waits, then collects everything
-    await sendMessage(chatId, "⏳ Collecting all photos from album...");
-    await new Promise<void>((resolve) => setTimeout(resolve, 5000));
-
-    // Read all buffered entries for this album
-    const prefix = `tg_mg_${message.media_group_id}_`;
-    const { data: bufferRows, error: readErr } = await supabase
-      .from("admin_settings")
-      .select("key, value")
-      .like("key", `${prefix}%`);
-
-    if (readErr) {
-      await sendMessage(chatId, `❌ Buffer read failed: ${readErr.message}`);
       return;
     }
 
-    const photoRows = (bufferRows ?? []).filter((r) => r.key.startsWith(`${prefix}photo_`));
-    const photoFileIds = photoRows.map((r) => r.value.fileId as string);
-
-    await sendMessage(chatId, `📸 Found ${photoFileIds.length} photo(s) — uploading...`);
-
-    // Clean up buffer
-    await supabase.from("admin_settings").delete().like("key", `${prefix}%`);
+    // ── Captioned album photo — creates the product ──────────────────────────
+    await sendMessage(chatId, "⏳ Publishing product...");
 
     try {
       const productId = crypto.randomUUID();
+
+      // Collect any photos that buffered before this message arrived
+      const pendingFileIds = await collectAndClearPendingPhotos(message.media_group_id);
+
+      // Upload the captioned photo + any pre-buffered photos, all in parallel
+      const allFileIds = [
+        ...(photo ? [photo.file_id] : []),
+        ...pendingFileIds,
+      ];
+
       const [parsed, ...maybeUrls] = await Promise.all([
         parseProductText(message.caption),
-        ...photoFileIds.map((fileId, i) =>
+        ...allFileIds.map((fileId, i) =>
           getFile(fileId).then((f) =>
             f.file_path
               ? downloadFile(f.file_path).then((buf) => uploadImageToR2(buf, productId, i))
@@ -192,10 +144,17 @@ async function handleMessage(message: TelegramMessage) {
       const imageUrls = maybeUrls.filter((u): u is string => u !== null);
       const { slug } = await createProductFromTelegram(parsed, imageUrls, []);
 
+      // Store the product mapping so late-arriving album photos can add themselves
+      await storeMediaGroupProduct(message.media_group_id, {
+        productId,
+        slug,
+        name: parsed.name,
+      });
+
       const siteUrl = process.env.NEXT_PUBLIC_SITE_URL ?? "https://ecommerce-omega-ashy-36.vercel.app";
       await sendMessage(
         chatId,
-        `✅ <b>Product published!</b>\n\n<b>${parsed.name}</b>\n📸 ${imageUrls.length} image(s)\n${parsed.sizes.join(", ")} | Rs. ${parsed.sale_price}\n\n🔗 <a href="${siteUrl}/products/${slug}">View on website</a>`
+        `✅ <b>Product published!</b>\n\n<b>${parsed.name}</b>\n📸 ${imageUrls.length} image(s) so far — more from the album will be added automatically\n${parsed.sizes.join(", ")} | Rs. ${parsed.sale_price}\n\n🔗 <a href="${siteUrl}/products/${slug}">View on website</a>`
       );
     } catch (error) {
       console.error("Error publishing product (album):", error);
