@@ -152,6 +152,54 @@ async function handleMessage(message: TelegramMessage) {
     return;
   }
 
+  // Handle /debug command — tests R2 and OpenAI connectivity
+  if (message.text === "/debug") {
+    await sendMessage(chatId, "🔍 Running diagnostics...");
+    const results: string[] = [];
+
+    // Check env vars
+    const envVars = ["TELEGRAM_BOT_TOKEN", "OPENAI_API_KEY", "R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET_NAME", "R2_PUBLIC_URL", "NEXT_PUBLIC_SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"];
+    const missing = envVars.filter(v => !process.env[v]);
+    if (missing.length > 0) {
+      results.push(`❌ Missing env vars: ${missing.join(", ")}`);
+    } else {
+      results.push("✅ All env vars present");
+    }
+
+    // Test OpenAI
+    try {
+      const { parseProductText } = await import("@/services/ai-parser.service");
+      const parsed = await parseProductText("Nike Air Max 90 White, Price: 4999, Sizes: 8 9 10, Brand: Nike, Category: sneakers, Gender: men");
+      results.push(`✅ OpenAI OK — parsed: ${parsed.name}`);
+    } catch (e) {
+      results.push(`❌ OpenAI failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+
+    // Test R2
+    try {
+      const { uploadImageToR2 } = await import("@/services/r2-upload.service");
+      const testBuffer = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64");
+      const url = await uploadImageToR2(testBuffer, "debug-test", 0);
+      results.push(`✅ R2 OK — url: ${url}`);
+    } catch (e) {
+      results.push(`❌ R2 failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+
+    // Test Supabase
+    try {
+      const { createClient } = await import("@supabase/supabase-js");
+      const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+      const { error } = await supabase.from("products").select("id").limit(1);
+      if (error) throw error;
+      results.push("✅ Supabase OK");
+    } catch (e) {
+      results.push(`❌ Supabase failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+
+    await sendMessage(chatId, results.join("\n"));
+    return;
+  }
+
   // Handle text-only messages (no photos)
   if (message.text && !message.photo && !message.video) {
     await sendMessage(
