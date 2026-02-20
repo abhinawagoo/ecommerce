@@ -78,28 +78,29 @@ async function processMediaGroup(group: BufferedMediaGroup) {
     // Generate product ID upfront for R2 paths
     const productId = crypto.randomUUID();
 
-    // Download and upload photos to R2
-    const imageUrls: string[] = [];
-    for (let i = 0; i < photoFileIds.length; i++) {
-      const file = await getFile(photoFileIds[i]);
-      if (!file.file_path) continue;
-      const buffer = await downloadFile(file.file_path);
-      const url = await uploadImageToR2(buffer, productId, i);
-      imageUrls.push(url);
-    }
+    // Run AI parsing + all image/video downloads in parallel
+    const [parsed, ...mediaResults] = await Promise.all([
+      parseProductText(caption),
+      ...photoFileIds.map((fileId, i) =>
+        getFile(fileId).then(f => f.file_path
+          ? downloadFile(f.file_path).then(buf => uploadImageToR2(buf, productId, i))
+          : null
+        )
+      ),
+      ...videoFileIds.map(fileId =>
+        getFile(fileId).then(f => f.file_path
+          ? downloadFile(f.file_path).then(buf => uploadVideoToR2(buf, productId))
+          : null
+        )
+      ),
+    ]);
 
-    // Download and upload videos to R2
-    const videoUrls: string[] = [];
-    for (const videoFileId of videoFileIds) {
-      const file = await getFile(videoFileId);
-      if (!file.file_path) continue;
-      const buffer = await downloadFile(file.file_path);
-      const url = await uploadVideoToR2(buffer, productId);
-      videoUrls.push(url);
-    }
-
-    // Parse product text with AI
-    const parsed = await parseProductText(caption);
+    const imageUrls = mediaResults
+      .slice(0, photoFileIds.length)
+      .filter((u): u is string => !!u);
+    const videoUrls = mediaResults
+      .slice(photoFileIds.length)
+      .filter((u): u is string => !!u);
 
     // Send confirmation with buttons
     const confirmMessage = buildConfirmationMessage(parsed, imageUrls.length, videoUrls.length);

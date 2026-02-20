@@ -1,5 +1,4 @@
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
-import sharp from "sharp";
 import { randomUUID } from "crypto";
 
 const s3 = new S3Client({
@@ -19,19 +18,15 @@ export async function uploadImageToR2(
   productId: string,
   position: number
 ): Promise<string> {
-  const webpBuffer = await sharp(buffer)
-    .webp({ quality: 85 })
-    .resize({ width: 1200, height: 1200, fit: "inside", withoutEnlargement: true })
-    .toBuffer();
-
-  const key = `products/${productId}/${randomUUID()}.webp`;
+  // Upload raw JPEG as-is — Telegram photos are already high quality
+  const key = `products/${productId}/${randomUUID()}.jpg`;
 
   await s3.send(
     new PutObjectCommand({
       Bucket: BUCKET,
       Key: key,
-      Body: webpBuffer,
-      ContentType: "image/webp",
+      Body: buffer,
+      ContentType: "image/jpeg",
       CacheControl: "public, max-age=31536000, immutable",
       Metadata: { position: String(position) },
     })
