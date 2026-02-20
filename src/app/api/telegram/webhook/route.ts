@@ -91,13 +91,18 @@ async function handleMessage(message: TelegramMessage) {
     // Buffer every photo in the album — each uses a unique key so concurrent
     // webhook calls never overwrite each other.
     if (photo) {
-      await bufferAlbumPhoto(
-        message.media_group_id,
-        chatId,
-        userId,
-        photo.file_id,
-        photo.file_unique_id
-      );
+      try {
+        await bufferAlbumPhoto(
+          message.media_group_id,
+          chatId,
+          userId,
+          photo.file_id,
+          photo.file_unique_id
+        );
+      } catch (e) {
+        console.error("bufferAlbumPhoto error:", e);
+        // Don't throw — let non-captioned messages exit cleanly even on error
+      }
     }
 
     // Store the caption when present (Telegram puts it on one of the messages).
@@ -109,8 +114,8 @@ async function handleMessage(message: TelegramMessage) {
     if (!message.caption) return;
 
     // Wait for the remaining album messages to arrive and be buffered.
-    // Telegram sends all album messages within ~1 second; 3 s is ample.
-    await new Promise<void>((resolve) => setTimeout(resolve, 3000));
+    // 5 s covers Telegram delivery (~1 s) + Vercel cold-start (~2-3 s).
+    await new Promise<void>((resolve) => setTimeout(resolve, 5000));
 
     // Collect all buffered photos + caption, clean up the temp rows.
     const group = await claimAndGetAlbumPhotos(message.media_group_id);

@@ -27,10 +27,16 @@ export async function bufferAlbumPhoto(
   fileUniqueId: string
 ): Promise<void> {
   const supabase = getServiceClient();
-  const { error } = await supabase.from("admin_settings").upsert({
-    key: `tg_mg_${mediaGroupId}_photo_${fileUniqueId}`,
-    value: { fileId: photoFileId, chatId, userId },
-  });
+  // onConflict: 'key' is required — admin_settings primary key is `id` (UUID),
+  // so without this, upsert defaults to ON CONFLICT (id) which never matches
+  // when id is auto-generated, potentially causing unique-constraint errors.
+  const { error } = await supabase.from("admin_settings").upsert(
+    {
+      key: `tg_mg_${mediaGroupId}_photo_${fileUniqueId}`,
+      value: { fileId: photoFileId, chatId, userId },
+    },
+    { onConflict: "key" }
+  );
   if (error) throw new Error(`bufferAlbumPhoto failed: ${error.message}`);
 }
 
@@ -41,10 +47,13 @@ export async function bufferAlbumCaption(
   caption: string
 ): Promise<void> {
   const supabase = getServiceClient();
-  const { error } = await supabase.from("admin_settings").upsert({
-    key: `tg_mg_${mediaGroupId}_caption`,
-    value: { caption, chatId, userId },
-  });
+  const { error } = await supabase.from("admin_settings").upsert(
+    {
+      key: `tg_mg_${mediaGroupId}_caption`,
+      value: { caption, chatId, userId },
+    },
+    { onConflict: "key" }
+  );
   if (error) throw new Error(`bufferAlbumCaption failed: ${error.message}`);
 }
 
