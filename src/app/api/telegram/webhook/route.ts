@@ -1,15 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
-import type {
-  TelegramUpdate,
-  TelegramMessage,
-  BufferedMediaGroup,
-  PendingProduct,
-  ParsedProductData,
-} from "@/types/telegram";
+import type { TelegramUpdate, TelegramMessage } from "@/types/telegram";
 import {
   sendMessage,
-  editMessageText,
-  answerCallbackQuery,
   getFile,
   downloadFile,
   isAdminUser,
@@ -22,119 +14,6 @@ import { createProductFromTelegram } from "@/services/product-admin.service";
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-// In-memory state (fine for single instance, 15-20 products/day)
-const mediaGroupBuffer = new Map<string, BufferedMediaGroup>();
-const pendingProducts = new Map<string, PendingProduct>();
-
-// Cleanup pending products older than 30 minutes
-function cleanupPendingProducts() {
-  const now = Date.now();
-  pendingProducts.forEach((pending, key) => {
-    if (now - pending.createdAt > 30 * 60 * 1000) {
-      pendingProducts.delete(key);
-    }
-  });
-}
-
-function formatCurrency(amount: number): string {
-  return `Rs. ${amount.toLocaleString("en-IN")}`;
-}
-
-function buildConfirmationMessage(parsed: ParsedProductData, photoCount: number, videoCount: number): string {
-  const mediaInfo = [
-    photoCount > 0 ? `${photoCount} photo${photoCount > 1 ? "s" : ""}` : "",
-    videoCount > 0 ? `${videoCount} video${videoCount > 1 ? "s" : ""}` : "",
-  ].filter(Boolean).join(", ");
-
-  return [
-    `📦 <b>New Product Parsed:</b>`,
-    ``,
-    `<b>Name:</b> ${parsed.name}`,
-    `<b>Brand:</b> ${parsed.brand}`,
-    `<b>Category:</b> ${parsed.category}`,
-    `<b>Gender:</b> ${parsed.gender}`,
-    `<b>Sizes:</b> ${parsed.sizes.join(", ")}`,
-    `<b>Price:</b> ${formatCurrency(parsed.sale_price)}`,
-    `<b>MRP:</b> ${formatCurrency(parsed.mrp)}`,
-    `<b>Color:</b> ${parsed.color}`,
-    `<b>Media:</b> ${mediaInfo || "none"}`,
-    ``,
-    `<b>Description:</b> ${parsed.description}`,
-    `<b>Slug:</b> /${parsed.slug}`,
-  ].join("\n");
-}
-
-async function processMediaGroup(group: BufferedMediaGroup) {
-  const { chatId, photoFileIds, videoFileIds, caption } = group;
-
-  if (!caption) {
-    await sendMessage(chatId, "⚠️ No caption found. Please send photos with a product description as the caption.");
-    return;
-  }
-
-  await sendMessage(chatId, "⏳ Processing your product listing...");
-
-  try {
-    // Generate product ID upfront for R2 paths
-    const productId = crypto.randomUUID();
-
-    // Run AI parsing + all image/video downloads in parallel
-    const [parsed, ...mediaResults] = await Promise.all([
-      parseProductText(caption),
-      ...photoFileIds.map((fileId, i) =>
-        getFile(fileId).then(f => f.file_path
-          ? downloadFile(f.file_path).then(buf => uploadImageToR2(buf, productId, i))
-          : null
-        )
-      ),
-      ...videoFileIds.map(fileId =>
-        getFile(fileId).then(f => f.file_path
-          ? downloadFile(f.file_path).then(buf => uploadVideoToR2(buf, productId))
-          : null
-        )
-      ),
-    ]);
-
-    const imageUrls = mediaResults
-      .slice(0, photoFileIds.length)
-      .filter((u): u is string => !!u);
-    const videoUrls = mediaResults
-      .slice(photoFileIds.length)
-      .filter((u): u is string => !!u);
-
-    // Send confirmation with buttons
-    const confirmMessage = buildConfirmationMessage(parsed, imageUrls.length, videoUrls.length);
-    const pendingKey = `pending_${chatId}_${Date.now()}`;
-
-    const sentMessage = await sendMessage(chatId, confirmMessage, {
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: "✅ Publish", callback_data: `publish:${pendingKey}` },
-            { text: "❌ Cancel", callback_data: `cancel:${pendingKey}` },
-          ],
-        ],
-      },
-    });
-
-    // Store pending product
-    pendingProducts.set(pendingKey, {
-      parsed,
-      imageUrls,
-      videoUrls,
-      chatId,
-      messageId: sentMessage.message_id,
-      createdAt: Date.now(),
-    });
-
-    cleanupPendingProducts();
-  } catch (error) {
-    console.error("Error processing media group:", error);
-    const errorMessage = error instanceof Error ? error.message : "Unknown error";
-    await sendMessage(chatId, `❌ Error processing product: ${errorMessage}`);
-  }
-}
-
 async function handleMessage(message: TelegramMessage) {
   const userId = message.from?.id;
   const chatId = message.chat.id;
@@ -144,49 +23,39 @@ async function handleMessage(message: TelegramMessage) {
     return;
   }
 
-  // Handle /start command
+  // /start
   if (message.text === "/start") {
     await sendMessage(
       chatId,
-      "👋 Welcome to the Product Listing Bot!\n\nSend me product photos with a caption containing the product details (name, price, sizes, etc.) and I'll create the listing for you."
+      "👋 Welcome to the Product Listing Bot!\n\nSend a photo with a caption containing product details (name, price, sizes, brand, category, gender) and I'll publish it automatically."
     );
     return;
   }
 
-  // Handle /debug command — tests R2 and OpenAI connectivity
+  // /debug — tests all service connections
   if (message.text === "/debug") {
     await sendMessage(chatId, "🔍 Running diagnostics...");
     const results: string[] = [];
 
-    // Check env vars
     const envVars = ["TELEGRAM_BOT_TOKEN", "OPENAI_API_KEY", "R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET_NAME", "R2_PUBLIC_URL", "NEXT_PUBLIC_SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"];
     const missing = envVars.filter(v => !process.env[v]);
-    if (missing.length > 0) {
-      results.push(`❌ Missing env vars: ${missing.join(", ")}`);
-    } else {
-      results.push("✅ All env vars present");
-    }
+    results.push(missing.length > 0 ? `❌ Missing env vars: ${missing.join(", ")}` : "✅ All env vars present");
 
-    // Test OpenAI
     try {
-      const { parseProductText } = await import("@/services/ai-parser.service");
       const parsed = await parseProductText("Nike Air Max 90 White, Price: 4999, Sizes: 8 9 10, Brand: Nike, Category: sneakers, Gender: men");
-      results.push(`✅ OpenAI OK — parsed: ${parsed.name}`);
+      results.push(`✅ OpenAI OK — ${parsed.name}`);
     } catch (e) {
       results.push(`❌ OpenAI failed: ${e instanceof Error ? e.message : String(e)}`);
     }
 
-    // Test R2
     try {
-      const { uploadImageToR2 } = await import("@/services/r2-upload.service");
       const testBuffer = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64");
       const url = await uploadImageToR2(testBuffer, "debug-test", 0);
-      results.push(`✅ R2 OK — url: ${url}`);
+      results.push(`✅ R2 OK — ${url}`);
     } catch (e) {
       results.push(`❌ R2 failed: ${e instanceof Error ? e.message : String(e)}`);
     }
 
-    // Test Supabase
     try {
       const { createClient } = await import("@supabase/supabase-js");
       const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
@@ -201,111 +70,63 @@ async function handleMessage(message: TelegramMessage) {
     return;
   }
 
-  // Handle text-only messages (no photos)
+  // Text-only message
   if (message.text && !message.photo && !message.video) {
-    await sendMessage(
-      chatId,
-      "📸 Please send photos along with the product description as a caption. Text-only messages are not supported for product listings."
-    );
+    await sendMessage(chatId, "📸 Please send a photo with the product details as the caption.");
     return;
   }
 
   const hasMedia = message.photo || message.video;
   if (!hasMedia) return;
 
-  // For media groups: only process the message that has the caption.
-  // Each photo in an album fires a separate webhook — we can't buffer with
-  // setTimeout on serverless (function dies after returning 200).
-  // So we process whichever message carries the caption and use that one photo.
-  if (message.media_group_id && !message.caption) {
-    // Part of an album but this message has no caption — skip it.
+  // For album (media_group): only process the message that has the caption.
+  // Other album messages have no caption — skip them.
+  if (message.media_group_id && !message.caption) return;
+
+  if (!message.caption) {
+    await sendMessage(chatId, "⚠️ No caption found. Please send the photo with product details in the caption.");
     return;
   }
 
-  // Process immediately (single photo OR album message with caption)
-  const group: BufferedMediaGroup = {
-    chatId,
-    userId,
-    caption: message.caption ?? null,
-    photoFileIds: [],
-    videoFileIds: [],
-    timer: null as unknown as ReturnType<typeof setTimeout>,
-  };
+  await sendMessage(chatId, "⏳ Publishing product...");
 
-  if (message.photo) {
-    const best = getHighestResolutionPhoto(message.photo);
-    group.photoFileIds.push(best.file_id);
-  }
-  if (message.video) {
-    group.videoFileIds.push(message.video.file_id);
-  }
+  try {
+    const productId = crypto.randomUUID();
+    const photoFileId = message.photo ? getHighestResolutionPhoto(message.photo).file_id : null;
+    const videoFileId = message.video?.file_id ?? null;
 
-  await processMediaGroup(group);
-}
+    // Run AI parsing + media download in parallel
+    const [parsed, imageUrl, videoUrl] = await Promise.all([
+      parseProductText(message.caption),
+      photoFileId
+        ? getFile(photoFileId).then(f =>
+            f.file_path ? downloadFile(f.file_path).then(buf => uploadImageToR2(buf, productId, 0)) : null
+          )
+        : Promise.resolve(null),
+      videoFileId
+        ? getFile(videoFileId).then(f =>
+            f.file_path ? downloadFile(f.file_path).then(buf => uploadVideoToR2(buf, productId)) : null
+          )
+        : Promise.resolve(null),
+    ]);
 
-async function handleCallbackQuery(callbackQuery: TelegramUpdate["callback_query"]) {
-  if (!callbackQuery?.data) return;
+    const imageUrls = imageUrl ? [imageUrl] : [];
+    const videoUrls = videoUrl ? [videoUrl] : [];
 
-  const { id: queryId, data, from } = callbackQuery;
+    const { slug } = await createProductFromTelegram(parsed, imageUrls, videoUrls);
 
-  if (!isAdminUser(from.id)) {
-    await answerCallbackQuery(queryId, "⛔ Unauthorized");
-    return;
-  }
-
-  const colonIdx = data.indexOf(":");
-  const action = data.substring(0, colonIdx);
-  const fullKey = data.substring(colonIdx + 1);
-
-  const chatId = callbackQuery.message?.chat.id;
-  const messageId = callbackQuery.message?.message_id;
-
-  if (!chatId || !messageId) {
-    await answerCallbackQuery(queryId, "Error: message not found");
-    return;
-  }
-
-  const pendingProduct = pendingProducts.get(fullKey);
-
-  if (!pendingProduct) {
-    await answerCallbackQuery(queryId, "⏰ This listing has expired. Please send again.");
-    await editMessageText(chatId, messageId, "⏰ Listing expired or already processed.");
-    return;
-  }
-
-  if (action === "publish") {
-    await answerCallbackQuery(queryId, "Publishing...");
-    await editMessageText(chatId, messageId, "⏳ Publishing product...");
-
-    try {
-      const { slug } = await createProductFromTelegram(
-        pendingProduct.parsed,
-        pendingProduct.imageUrls,
-        pendingProduct.videoUrls
-      );
-
-      const siteUrl = process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000";
-      await editMessageText(
-        chatId,
-        messageId,
-        `✅ <b>Product published!</b>\n\n<b>${pendingProduct.parsed.name}</b>\n\n🔗 <a href="${siteUrl}/products/${slug}">View on website</a>`
-      );
-    } catch (error) {
-      console.error("Error publishing product:", error);
-      const errorMessage = error instanceof Error ? error.message : "Unknown error";
-      await editMessageText(chatId, messageId, `❌ Failed to publish: ${errorMessage}`);
-    }
-
-    pendingProducts.delete(fullKey);
-  } else if (action === "cancel") {
-    await answerCallbackQuery(queryId, "Cancelled");
-    await editMessageText(chatId, messageId, "❌ Product listing cancelled.");
-    pendingProducts.delete(fullKey);
+    const siteUrl = process.env.NEXT_PUBLIC_SITE_URL ?? "https://ecommerce-omega-ashy-36.vercel.app";
+    await sendMessage(
+      chatId,
+      `✅ <b>Product published!</b>\n\n<b>${parsed.name}</b>\n${parsed.sizes.join(", ")} | Rs. ${parsed.sale_price}\n\n🔗 <a href="${siteUrl}/products/${slug}">View on website</a>`
+    );
+  } catch (error) {
+    console.error("Error publishing product:", error);
+    await sendMessage(chatId, `❌ Failed: ${error instanceof Error ? error.message : "Unknown error"}`);
   }
 }
 
 export async function POST(request: NextRequest) {
-  // Verify webhook secret
   const secretHeader = request.headers.get("x-telegram-bot-api-secret-token");
   const expectedSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
 
@@ -315,17 +136,12 @@ export async function POST(request: NextRequest) {
 
   try {
     const update: TelegramUpdate = await request.json();
-
-    if (update.callback_query) {
-      await handleCallbackQuery(update.callback_query);
-    } else if (update.message) {
+    if (update.message) {
       await handleMessage(update.message);
     }
-
     return NextResponse.json({ ok: true });
   } catch (error) {
     console.error("Webhook error:", error);
-    // Always return 200 to prevent Telegram from retrying
     return NextResponse.json({ ok: true });
   }
 }
